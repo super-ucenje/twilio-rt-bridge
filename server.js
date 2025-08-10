@@ -126,7 +126,12 @@ app.post("/trigger-call", async (req, res) => {
 });
 
 
+// ... keep your imports, env, express routes (/health, /twiml, /trigger-call) ...
+
 // ----- WS: Twilio <Stream> ↔ OpenAI Realtime -----
+import { WebSocketServer, WebSocket } from "ws";
+import http from "http";
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
@@ -134,6 +139,7 @@ wss.on("connection", (twilio) => {
   let streamSid = "";
   let closed = false;
 
+  // outbound pacing queue (160 bytes == 20 ms μ-law @ 8 kHz)
   let outQueue = Buffer.alloc(0);
   let pacingTimer = null;
   function enqueueToTwilio(ulawBytes) {
@@ -152,99 +158,146 @@ wss.on("connection", (twilio) => {
     }
   }
 
+  // small test beep so you know outbound is alive
+  function makeBeepUlaw(ms = 200, freq = 880, amp = 9000) {
+    const BIAS = 0x84, CLIP = 32635;
+    const samples = Math.floor(8000 * (ms / 1000));
+    const out = new Uint8Array(samples);
+    for (let n = 0; n < samples; n++) {
+      let s = Math.round(amp * Math.sin(2 * Math.PI * freq * (n / 8000)));
+      let sign = (s >> 8) & 0x80;
+      if (sign !== 0) s = -s;
+      if (s > CLIP) s = CLIP;
+      s += BIAS;
+      let exponent = 7;
+      for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
+      const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
+      out[n] = ~(sign | (exponent << 4) | mantissa) & 0xff;
+    }
+    return out;
+  }
+
+  // --- OpenAI Realtime WS ---
   const oa = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(process.env.REALTIME_MODEL || "gpt-4o-realtime-preview")}`,
     {
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY || ""}`,
         "OpenAI-Beta": "realtime=v1"
       }
     }
   );
 
+  // state for committing audio and triggering responses
+  let lastAppendAt = 0;
+  let commitTimer = null;
+  let awaitingResponse = false;
+
+  function scheduleCommitAndRespond(delay = 300) {
+    if (commitTimer) clearTimeout(commitTimer);
+    commitTimer = setTimeout(() => {
+      if (oa.readyState !== WebSocket.OPEN) return;
+      // commit whatever we appended since last time
+      oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      // ask the model to respond (one at a time)
+      if (!awaitingResponse) {
+        awaitingResponse = true;
+        oa.send(JSON.stringify({ type: "response.create", response: { conversation: "default" } }));
+      }
+    }, delay);
+  }
+
   oa.on("open", () => {
-    const sessionUpdate = {
+    // Configure session for μ-law 8 kHz in/out, Croatian, server VAD, and voice
+    const LANG = (process.env.LANG || "hr").toLowerCase().slice(0,2);
+    const VOICE = process.env.VOICE || "alloy";
+    const SESSION_INSTRUCTIONS = process.env.SESSION_INSTRUCTIONS ||
+      "Ti si Ivana, ljubazna agentica korisničke podrške. Odgovaraj kratko i na hrvatskom. Ako ne znaš odgovor, reci da će te kolega uskoro nazvati.";
+
+    oa.send(JSON.stringify({
       type: "session.update",
       session: {
         instructions: SESSION_INSTRUCTIONS,
         modalities: ["text", "audio"],
         voice: VOICE,
-        turn_detection: { type: "server_vad", silence_duration_ms: 600 },
-        input_audio_transcription: { model: "whisper-1", language: LANG },
         input_audio_format: "g711_ulaw",
         input_audio_sample_rate_hz: 8000,
+        input_audio_transcription: { model: "whisper-1", language: LANG },
         output_audio_format: "g711_ulaw",
-        output_audio_sample_rate_hz: 8000
+        output_audio_sample_rate_hz: 8000,
+        // server VAD lets us skip manual commit; we’ll still commit on short pauses to be proactive
+        turn_detection: { type: "server_vad", silence_duration_ms: 400 }
       }
-    };
-    oa.send(JSON.stringify(sessionUpdate));
+    }));
+
+    // Proactive greeting (don’t wait for user)
+    oa.send(JSON.stringify({
+      type: "response.create",
+      response: { instructions: "Pozdrav! Kako Vam mogu pomoći?" }
+    }));
   });
 
   oa.on("message", (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    const isDelta =
-      msg.type === "response.output_audio.delta" ||
-      msg.type === "response.audio.delta" ||
-      msg.type === "response.delta";
-
-    if (isDelta && msg.delta?.audio) {
+    // stream μ-law audio from OpenAI → Twilio
+    if (
+      (msg.type === "response.output_audio.delta" ||
+       msg.type === "response.audio.delta" ||
+       msg.type === "response.delta") && msg.delta?.audio
+    ) {
       const ulawChunk = Buffer.from(msg.delta.audio, "base64");
       enqueueToTwilio(ulawChunk);
     }
 
-    if (msg.type === "session.updated") {
-      const greet = {
-        type: "response.create",
-        response: { instructions: "Pozdrav! Kako Vam mogu pomoći?" }
-      };
-      try { oa.send(JSON.stringify(greet)); } catch {}
+    // when a response completes, allow the next one
+    if (msg.type === "response.completed" || msg.type === "response.error") {
+      awaitingResponse = false;
     }
   });
 
-  oa.on("close", () => { if (!closed) try { twilio.close(); } catch (_) {} });
   oa.on("error", (e) => console.error("OpenAI WS error:", e?.message || e));
+  oa.on("close", () => { if (!closed) try { twilio.close(); } catch {} });
 
+  // --- Twilio <Stream> side ---
   twilio.on("message", (raw) => {
-    let m;
-    try { m = JSON.parse(raw.toString()); } catch { return; }
+    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     const ev = m.event;
 
     if (ev === "start") {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
-      const beep = makeBeepUlaw(200, 880);
-      enqueueToTwilio(beep);
+      // short audible cue
+      enqueueToTwilio(makeBeepUlaw(180, 880));
       return;
     }
 
     if (ev === "media") {
       const b64 = m.media?.payload;
       if (!b64 || oa.readyState !== WebSocket.OPEN) return;
+      // append caller audio to OpenAI
       oa.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+      lastAppendAt = Date.now();
+      // commit+respond after a short pause to reduce latency
+      scheduleCommitAndRespond(300);
       return;
     }
 
     if (ev === "stop") {
       closed = true;
-      try { oa.close(); } catch (_e) {}
-      try { twilio.close(); } catch (_e) {}
+      if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
       if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
+      try { oa.close(); } catch {}
+      try { twilio.close(); } catch {}
       return;
     }
   });
 
   twilio.on("close", () => {
     closed = true;
+    if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
     if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
-    try { oa.close(); } catch (_) {}
+    try { oa.close(); } catch {}
   });
-
-  const ping = setInterval(() => {
-    if (twilio.readyState === WebSocket.OPEN) try { twilio.ping(); } catch (_) {}
-    if (oa.readyState === WebSocket.OPEN) try { oa.ping?.(); } catch (_) {}
-  }, 10000);
-  twilio.on("close", () => clearInterval(ping));
 });
 
 const PORT = process.env.PORT || 3000;
