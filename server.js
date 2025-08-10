@@ -88,14 +88,21 @@ app.post("/trigger-call", async (req, res) => {
     if (!TWILIO_FROM)
       return res.status(400).json({ ok: false, error: "Missing TWILIO_FROM env (verified/purchased E.164)" });
 
-    const twimlUrl = TWIML_URL || (BASE_URL ? `${BASE_URL}/twiml` : "");
-    if (!twimlUrl)
-      return res.status(400).json({ ok: false, error: "Missing TWIML_URL or BASE_URL env" });
+    const host = req.get("host");
+    const base = BASE_URL || `https://${host}`;
+    const wsUrl = base.replace(/^http/, "ws") + "/ws";
+
+    const twiml = `
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}"/>
+  </Connect>
+</Response>`.trim();
 
     const form = new URLSearchParams();
     form.set("To", to);
     form.set("From", TWILIO_FROM);
-    form.set("Url", twimlUrl);
+    form.set("Twiml", twiml);
     if (TWILIO_MACHINE_DETECTION) form.set("MachineDetection", TWILIO_MACHINE_DETECTION);
 
     const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`, {
@@ -104,20 +111,20 @@ app.post("/trigger-call", async (req, res) => {
         "Authorization": "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
         "Content-Type": "application/x-www-form-urlencoded"
       },
-      body: form.toString(),
-      timeout: 15000
+      body: form.toString()
     });
 
     const text = await resp.text();
     let payload;
     try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
 
-    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload });
-    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to });
+    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload, wsUrl, inlineTwiml: true });
+    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to, wsUrl, inlineTwiml: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e) });
   }
 });
+
 
 // ----- WS: Twilio <Stream> ↔ OpenAI Realtime -----
 const server = http.createServer(app);
