@@ -1,7 +1,7 @@
 // server.js — Railway Node service: Twilio outbound + Twilio <Stream> ↔ OpenAI Realtime
 import express from "express";
 import http from "http";
-import { WebSocketServer, WebSocket } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 // ----- ENV -----
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
@@ -24,16 +24,6 @@ const TWIML_URL = process.env.TWIML_URL || "";
 const BASE_URL  = process.env.BASE_URL  || "";
 
 // ----- μ-law helpers -----
-function chunk160Base64(ulawBytes) {
-  const chunks = [];
-  for (let i = 0; i < ulawBytes.length; i += 160) {
-    const slice = ulawBytes.subarray(i, Math.min(i + 160, ulawBytes.length));
-    const padded = new Uint8Array(160);
-    padded.set(slice);
-    chunks.push(Buffer.from(padded).toString("base64"));
-  }
-  return chunks;
-}
 function makeBeepUlaw(ms = 250, freq = 880, amp = 9000) {
   const BIAS = 0x84, CLIP = 32635;
   const samples = Math.floor(8000 * (ms / 1000));
@@ -45,10 +35,9 @@ function makeBeepUlaw(ms = 250, freq = 880, amp = 9000) {
     if (s > CLIP) s = CLIP;
     s += BIAS;
     let exponent = 7;
-    for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+    for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
     const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
-    const ulaw = ~(sign | (exponent << 4) | mantissa) & 0xff;
-    out[n] = ulaw;
+    out[n] = ~(sign | (exponent << 4) | mantissa) & 0xff;
   }
   return out;
 }
@@ -102,7 +91,7 @@ app.post("/trigger-call", async (req, res) => {
     const form = new URLSearchParams();
     form.set("To", to);
     form.set("From", TWILIO_FROM);
-    form.set("Twiml", twiml);
+    if (TWIML_URL) form.set("Url", TWIML_URL); else form.set("Twiml", twiml);
     if (TWILIO_MACHINE_DETECTION) form.set("MachineDetection", TWILIO_MACHINE_DETECTION);
 
     const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`, {
@@ -118,20 +107,14 @@ app.post("/trigger-call", async (req, res) => {
     let payload;
     try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
 
-    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload, wsUrl, inlineTwiml: true });
-    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to, wsUrl, inlineTwiml: true });
+    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload, wsUrl, used: TWIML_URL ? "Url" : "Twiml" });
+    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to, wsUrl, used: TWIML_URL ? "Url" : "Twiml" });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-
-// ... keep your imports, env, express routes (/health, /twiml, /trigger-call) ...
-
 // ----- WS: Twilio <Stream> ↔ OpenAI Realtime -----
-import { WebSocketServer, WebSocket } from "ws";
-import http from "http";
-
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
@@ -158,38 +141,18 @@ wss.on("connection", (twilio) => {
     }
   }
 
-  // small test beep so you know outbound is alive
-  function makeBeepUlaw(ms = 200, freq = 880, amp = 9000) {
-    const BIAS = 0x84, CLIP = 32635;
-    const samples = Math.floor(8000 * (ms / 1000));
-    const out = new Uint8Array(samples);
-    for (let n = 0; n < samples; n++) {
-      let s = Math.round(amp * Math.sin(2 * Math.PI * freq * (n / 8000)));
-      let sign = (s >> 8) & 0x80;
-      if (sign !== 0) s = -s;
-      if (s > CLIP) s = CLIP;
-      s += BIAS;
-      let exponent = 7;
-      for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
-      const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
-      out[n] = ~(sign | (exponent << 4) | mantissa) & 0xff;
-    }
-    return out;
-  }
-
   // --- OpenAI Realtime WS ---
   const oa = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(process.env.REALTIME_MODEL || "gpt-4o-realtime-preview")}`,
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
     {
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY || ""}`,
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         "OpenAI-Beta": "realtime=v1"
       }
     }
   );
 
   // state for committing audio and triggering responses
-  let lastAppendAt = 0;
   let commitTimer = null;
   let awaitingResponse = false;
 
@@ -197,9 +160,7 @@ wss.on("connection", (twilio) => {
     if (commitTimer) clearTimeout(commitTimer);
     commitTimer = setTimeout(() => {
       if (oa.readyState !== WebSocket.OPEN) return;
-      // commit whatever we appended since last time
       oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      // ask the model to respond (one at a time)
       if (!awaitingResponse) {
         awaitingResponse = true;
         oa.send(JSON.stringify({ type: "response.create", response: { conversation: "default" } }));
@@ -208,12 +169,6 @@ wss.on("connection", (twilio) => {
   }
 
   oa.on("open", () => {
-    // Configure session for μ-law 8 kHz in/out, Croatian, server VAD, and voice
-    const LANG = (process.env.LANG || "hr").toLowerCase().slice(0,2);
-    const VOICE = process.env.VOICE || "alloy";
-    const SESSION_INSTRUCTIONS = process.env.SESSION_INSTRUCTIONS ||
-      "Ti si Ivana, ljubazna agentica korisničke podrške. Odgovaraj kratko i na hrvatskom. Ako ne znaš odgovor, reci da će te kolega uskoro nazvati.";
-
     oa.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -225,12 +180,11 @@ wss.on("connection", (twilio) => {
         input_audio_transcription: { model: "whisper-1", language: LANG },
         output_audio_format: "g711_ulaw",
         output_audio_sample_rate_hz: 8000,
-        // server VAD lets us skip manual commit; we’ll still commit on short pauses to be proactive
         turn_detection: { type: "server_vad", silence_duration_ms: 400 }
       }
     }));
 
-    // Proactive greeting (don’t wait for user)
+    // proactive greeting
     oa.send(JSON.stringify({
       type: "response.create",
       response: { instructions: "Pozdrav! Kako Vam mogu pomoći?" }
@@ -250,7 +204,6 @@ wss.on("connection", (twilio) => {
       enqueueToTwilio(ulawChunk);
     }
 
-    // when a response completes, allow the next one
     if (msg.type === "response.completed" || msg.type === "response.error") {
       awaitingResponse = false;
     }
@@ -266,7 +219,6 @@ wss.on("connection", (twilio) => {
 
     if (ev === "start") {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
-      // short audible cue
       enqueueToTwilio(makeBeepUlaw(180, 880));
       return;
     }
@@ -274,10 +226,7 @@ wss.on("connection", (twilio) => {
     if (ev === "media") {
       const b64 = m.media?.payload;
       if (!b64 || oa.readyState !== WebSocket.OPEN) return;
-      // append caller audio to OpenAI
       oa.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      lastAppendAt = Date.now();
-      // commit+respond after a short pause to reduce latency
       scheduleCommitAndRespond(300);
       return;
     }
