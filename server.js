@@ -71,11 +71,37 @@ app.get("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml; charset=utf-8").status(200).send(xml);
 });
 
+// Twilio status callbacks (form-encoded)
+app.post("/twilio-status", express.urlencoded({ extended: false }), (req, res) => {
+  console.log("[/twilio-status]", req.body);
+  res.sendStatus(204);
+});
+
+app.post("/twiml", (req, res) => {
+  const base = BASE_URL || `https://${req.get("host")}`;
+  const wsUrl = base.replace(/^http/, "ws") + "/ws";
+  const xml = `
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}"/>
+  </Connect>
+</Response>`.trim();
+  console.log("[/twiml:POST] wsUrl:", wsUrl);
+  res.set("Content-Type", "text/xml; charset=utf-8").status(200).send(xml);
+});
+
 // Twilio status callback (so we can see failures)
 app.post("/twilio-status", (req, res) => {
   console.log("[/twilio-status]", JSON.stringify(req.body || {}, null, 2));
   res.status(200).send("ok");
 });
+
+// Helper: figure out your public base URL
+function hostBase(req) {
+  return (process.env.BASE_URL && process.env.BASE_URL.trim())
+    ? process.env.BASE_URL.trim()
+    : `https://${req.get("host")}`;
+}
 
 // Outbound call trigger (POST /trigger-call {to:"+3859..."})
 app.post("/trigger-call", async (req, res) => {
@@ -86,28 +112,26 @@ app.post("/trigger-call", async (req, res) => {
     let to = rawTo.replace(/[^\d+]/g, "");
     if (!to.startsWith("+")) to = "+" + to;
 
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
       return res.status(400).json({ ok: false, error: "Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN env" });
-    if (!TWILIO_FROM)
+    }
+    if (!TWILIO_FROM) {
       return res.status(400).json({ ok: false, error: "Missing TWILIO_FROM env (verified/purchased E.164)" });
+    }
 
     const base = hostBase(req);
     const wsUrl = base.replace(/^http/, "ws") + "/ws";
 
-    // Either inline TwiML or fetch from /twiml
-    let used;
+    // Build form body
     const form = new URLSearchParams();
     form.set("To", to);
     form.set("From", TWILIO_FROM);
-    if (TWILIO_MACHINE_DETECTION) form.set("MachineDetection", TWILIO_MACHINE_DETECTION);
 
-    // Status callback to see exact Twilio error reasons
-    form.set("StatusCallback", base + "/twilio-status");
-    form.set("StatusCallbackEvent", "initiated ringing answered completed");
-
-    if (TWIML_URL) {
+    // Either point Twilio at a TwiML URL, or inline TwiML
+    let used;
+    if (TWIML_URL && TWIML_URL.trim()) {
       used = "Url";
-      form.set("Url", TWIML_URL);
+      form.set("Url", TWIML_URL.trim());
     } else {
       used = "Twiml";
       const twiml = `
@@ -118,6 +142,17 @@ app.post("/trigger-call", async (req, res) => {
 </Response>`.trim();
       form.set("Twiml", twiml);
     }
+
+    // Optional machine detection
+    if (TWILIO_MACHINE_DETECTION && TWILIO_MACHINE_DETECTION.trim()) {
+      form.set("MachineDetection", TWILIO_MACHINE_DETECTION.trim());
+    }
+
+    // Status callbacks (send as REPEATED params)
+    form.set("StatusCallback", base + "/twilio-status");
+    ["initiated", "ringing", "answered", "completed"].forEach(ev => {
+      form.append("StatusCallbackEvent", ev);
+    });
 
     console.log("[/trigger-call] creating call", { to, used, wsUrl });
 
@@ -135,9 +170,18 @@ app.post("/trigger-call", async (req, res) => {
     try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
 
     console.log("[/trigger-call] Twilio resp", resp.status, payload);
-    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload, wsUrl, used });
+    if (!resp.ok) {
+      return res.status(resp.status).json({ ok: false, error: payload, wsUrl, used });
+    }
 
-    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to, wsUrl, used });
+    return res.status(200).json({
+      ok: true,
+      call_sid: payload.sid,
+      status: payload.status,
+      to,
+      wsUrl,
+      used
+    });
   } catch (e) {
     console.error("[/trigger-call] error", e);
     return res.status(500).json({ ok: false, error: String(e) });
