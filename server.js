@@ -1,5 +1,5 @@
 // server.js — Twilio <Stream> ↔ OpenAI Realtime (μ-law 8k), outbound dial
-// Clean handlers order, keepalive pings, strict audio modalities, concise logs.
+// Ensures OA outputs g711_ulaw and pushes 160B frames to Twilio.
 
 import express from "express";
 import http from "http";
@@ -22,7 +22,7 @@ const TWILIO_AUTH_TOKEN        = process.env.TWILIO_AUTH_TOKEN  || "";
 const TWILIO_FROM              = process.env.TWILIO_FROM        || "";
 const TWILIO_MACHINE_DETECTION = (process.env.TWILIO_MACHINE_DETECTION || "").trim();
 
-// TwiML / public URL
+// Public URL / TwiML
 const TWIML_URL = (process.env.TWIML_URL || "").trim();
 const BASE_URL  = (process.env.BASE_URL  || "").trim();
 
@@ -184,7 +184,7 @@ wss.on("connection", (twilio, req) => {
     }
   );
 
-  // Keep-alive (some hosts drop idle WS)
+  // Keep-alive
   const keepAlive = setInterval(() => {
     try { oa.ping(); } catch {}
     try { twilio.ping?.(); } catch {}
@@ -202,20 +202,19 @@ wss.on("connection", (twilio, req) => {
         awaitingResponse = true;
         oa.send(JSON.stringify({
           type: "response.create",
-          response: { modalities: ["audio", "text"] } // request audio out
+          response: {
+            modalities: ["audio", "text"],
+            audio: { voice: VOICE, format: "g711_ulaw" }   // <-- force μ-law out
+          }
         }));
       }
     }, delay);
   }
 
-  // Register OA handlers first (so early events aren’t missed)
   oa.on("message", (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); }
-    catch {
-      console.warn("[OA raw]", data?.toString?.().slice(0, 200));
-      return;
-    }
+    catch { console.warn("[OA raw]", data?.toString?.().slice(0, 200)); return; }
 
     if (DEBUG && msg?.type) console.log("[OA]", msg.type);
 
@@ -255,7 +254,7 @@ wss.on("connection", (twilio, req) => {
   oa.on("open", () => {
     console.log("[/ws->OA] Realtime open");
 
-    // Session config (audio in/out = G.711 μ-law @ 8 kHz)
+    // Session config: μ-law in/out and Croatian transcription
     oa.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -267,10 +266,9 @@ wss.on("connection", (twilio, req) => {
         input_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: LANG },
 
-        // OpenAI -> Twilio audio
-        audio_format: "g711_ulaw",
+        // OpenAI -> Twilio audio (correct field)
+        output_audio_format: "g711_ulaw",
 
-        // Server-side VAD (we still proactively commit on small pauses)
         turn_detection: { type: "server_vad", silence_duration_ms: 400 }
       }
     }));
@@ -278,7 +276,11 @@ wss.on("connection", (twilio, req) => {
     // Proactive greeting (audio)
     oa.send(JSON.stringify({
       type: "response.create",
-      response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
+      response: {
+        modalities: ["audio", "text"],
+        instructions: "Pozdrav! Kako Vam mogu pomoći?",
+        audio: { voice: VOICE, format: "g711_ulaw" } // <-- force μ-law for this response
+      }
     }));
   });
 
@@ -295,7 +297,7 @@ wss.on("connection", (twilio, req) => {
     if (ev === "start") {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
       console.log("[/ws] event=start streamSid=", streamSid);
-      enqueueToTwilio(makeBeepUlaw(180, 880)); // sanity beep
+      enqueueToTwilio(makeBeepUlaw(180, 880));
       return;
     }
 
@@ -303,7 +305,7 @@ wss.on("connection", (twilio, req) => {
       const b64 = m.media?.payload;
       if (!b64 || oa.readyState !== WebSocket.OPEN) return;
       oa.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      scheduleCommitAndRespond(250); // quick turn-around
+      scheduleCommitAndRespond(250);
       return;
     }
 
