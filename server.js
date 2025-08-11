@@ -1,9 +1,9 @@
-// server.js — Twilio <Stream> ↔ OpenAI Realtime (μ-law 8k), outbound dial
+// server.js — Twilio <Stream> ↔ OpenAI Realtime (G.711 μ-law 8k) + outbound dial
 // Fixes:
-//  - Use WS subprotocol "realtime"
-//  - session.update: use input_audio_format & output_audio_format (no sample-rate keys)
-//  - Decode OpenAI audio from msg.delta for `response.audio.delta`
-//  - Keep simple pacing back to Twilio (160B every ~20ms)
+//  • Normalize LANG (handles C.UTF-8 etc.)
+//  • Valid session fields; request audio+text responses
+//  • Read OpenAI audio from msg.delta (string) and pace as 160B/20ms
+//  • Send Twilio media with track:"outbound"
 
 import express from "express";
 import http from "http";
@@ -12,7 +12,7 @@ import WebSocket, { WebSocketServer } from "ws";
 // ---------- ENV ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const REALTIME_MODEL = process.env.REALTIME_MODEL || "gpt-4o-realtime-preview";
-const LANG           = (process.env.LANG || "hr").toLowerCase().slice(0, 2);
+const RAW_LANG       = process.env.LANG || "hr";
 const VOICE          = process.env.VOICE || "alloy";
 const DEBUG          = (process.env.DEBUG || "0") === "1";
 
@@ -20,19 +20,37 @@ const SESSION_INSTRUCTIONS =
   process.env.SESSION_INSTRUCTIONS ||
   "Ti si Ivana, ljubazna agentica korisničke podrške. Odgovaraj kratko i na hrvatskom. Ako ne znaš odgovor, reci da će te kolega uskoro nazvati.";
 
+// Twilio outbound
 const TWILIO_ACCOUNT_SID       = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN        = process.env.TWILIO_AUTH_TOKEN  || "";
 const TWILIO_FROM              = process.env.TWILIO_FROM        || "";
 const TWILIO_MACHINE_DETECTION = (process.env.TWILIO_MACHINE_DETECTION || "").trim();
 
+// Public URL / TwiML
 const TWIML_URL = (process.env.TWIML_URL || "").trim();
 const BASE_URL  = (process.env.BASE_URL  || "").trim();
 
-// ---------- helpers ----------
-function hostBase(req) {
-  return BASE_URL || `https://${req.get("host")}`;
-}
+// ---------- utils ----------
+const OA_LANGS = new Set([
+  "af","ar","az","be","bg","bs","ca","cs","cy","da","de","el","en","es","et",
+  "fa","fi","fr","gl","he","hi","hr","hu","hy","id","is","it","ja","kk","kn",
+  "ko","lt","lv","mi","mk","mr","ms","ne","nl","no","pl","pt","ro","ru","sk",
+  "sl","sr","sv","sw","ta","th","tl","tr","uk","ur","vi","zh"
+]);
 
+function normLang(v, fallback = "hr") {
+  if (!v) return fallback;
+  let s = String(v).trim().toLowerCase();
+  // handle "C", "C.UTF-8"
+  if (s === "c" || s.startsWith("c.")) return fallback;
+  // take first token before _ . -
+  s = s.split(/[_.-]/)[0];
+  if (s.length !== 2) return fallback;
+  return OA_LANGS.has(s) ? s : fallback;
+}
+const LANG = normLang(RAW_LANG);
+
+// 8k μ-law beep
 function makeBeepUlaw(ms = 180, freq = 880, amp = 9000) {
   const BIAS = 0x84, CLIP = 32635;
   const samples = Math.floor(8000 * (ms / 1000));
@@ -51,6 +69,10 @@ function makeBeepUlaw(ms = 180, freq = 880, amp = 9000) {
   return out;
 }
 
+function hostBase(req) {
+  return BASE_URL || `https://${req.get("host")}`;
+}
+
 // ---------- app ----------
 const app = express();
 app.use(express.json());
@@ -59,7 +81,7 @@ app.use(express.urlencoded({ extended: false })); // Twilio posts form data
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// Serve TwiML on GET and POST
+// TwiML (GET or POST)
 app.all("/twiml", (req, res) => {
   const wsUrl = hostBase(req).replace(/^http/, "ws") + "/ws";
   const xml = `
@@ -68,17 +90,17 @@ app.all("/twiml", (req, res) => {
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`.trim();
-  console.log(`[twiml:${req.method}] wsUrl=`, wsUrl);
+  console.log(`[twiml:${req.method}] wsUrl=${wsUrl}`);
   res.set("Content-Type", "text/xml; charset=utf-8").status(200).send(xml);
 });
 
-// Twilio call status callback
+// Twilio status callback (debug)
 app.post("/twilio-status", (req, res) => {
   console.log("[/twilio-status]", JSON.stringify(req.body || {}, null, 2));
   res.sendStatus(204);
 });
 
-// Trigger outbound call: POST /trigger-call {"to":"+385953881324"}
+// Outbound call trigger: POST /trigger-call {"to":"+385953881324"}
 app.post("/trigger-call", async (req, res) => {
   try {
     const rawTo = String(req.body.to || req.body.phone || "").trim();
@@ -152,7 +174,7 @@ wss.on("connection", (twilio, req) => {
   let closed = false;
   console.log("[/ws] Twilio connected from", req.socket.remoteAddress);
 
-  // Strict 160B μ-law frames every ~20 ms
+  // Pace μ-law back to Twilio: 160 bytes every ~20ms
   let outQueue = Buffer.alloc(0);
   let pacingTimer = null;
   function enqueueToTwilio(ulawBytes) {
@@ -165,7 +187,12 @@ wss.on("connection", (twilio, req) => {
         outQueue = outQueue.subarray(Math.min(160, outQueue.length));
         const payload = Buffer.from(frame).toString("base64");
         try {
-          twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+          twilio.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload, track: "outbound" } // explicit outbound
+          }));
+          if (DEBUG) console.log("[twilio<-oa] 160B");
         } catch (e) {
           console.warn("[/ws] twilio.send failed", e?.message || e);
         }
@@ -173,7 +200,7 @@ wss.on("connection", (twilio, req) => {
     }
   }
 
-  // Connect to OpenAI Realtime (IMPORTANT: subprotocol "realtime")
+  // OpenAI Realtime (subprotocol "realtime")
   if (!OPENAI_API_KEY) console.error("[/ws] OPENAI_API_KEY missing");
   const oa = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
@@ -186,6 +213,13 @@ wss.on("connection", (twilio, req) => {
     }
   );
 
+  // Keep-alive
+  const keepAlive = setInterval(() => {
+    try { oa.ping(); } catch {}
+    try { twilio.ping?.(); } catch {}
+  }, 15000);
+
+  // Turn handling
   let commitTimer = null;
   let awaitingResponse = false;
   function scheduleCommitAndRespond(delay = 250) {
@@ -195,35 +229,29 @@ wss.on("connection", (twilio, req) => {
       oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       if (!awaitingResponse) {
         awaitingResponse = true;
-        // Force audio output each time; Realtime will also include text.
-        oa.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
+        oa.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] }
+        }));
       }
     }, delay);
   }
 
   oa.on("open", () => {
     console.log("[/ws->OA] Realtime open");
-
-    // Session config: use G.711 μ-law both ways; let server VAD segment.
     oa.send(JSON.stringify({
       type: "session.update",
       session: {
         instructions: SESSION_INSTRUCTIONS,
         modalities: ["audio", "text"],
         voice: VOICE,
-
-        // Twilio -> OpenAI audio
         input_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "whisper-1", language: LANG },
-
-        // OpenAI -> Twilio audio (NOTE: correct key is output_audio_format)
         output_audio_format: "g711_ulaw",
-
         turn_detection: { type: "server_vad", silence_duration_ms: 400 }
       }
     }));
-
-    // Proactive greeting so user hears voice right after the beep
+    // Proactive greeting
     oa.send(JSON.stringify({
       type: "response.create",
       response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
@@ -231,28 +259,20 @@ wss.on("connection", (twilio, req) => {
   });
 
   oa.on("message", (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); }
-    catch {
-      if (DEBUG) console.warn("[OA raw]", data?.toString?.().slice(0, 200));
-      return;
-    }
-
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
     if (DEBUG && msg?.type) console.log("[OA]", msg.type);
 
-    // IMPORTANT: OpenAI audio comes as base64 in msg.delta for response.audio.delta
+    // Audio deltas (base64 μ-law bytes in msg.delta)
     if (msg.type === "response.audio.delta" && typeof msg.delta === "string" && msg.delta.length) {
-      const ulawChunk = Buffer.from(msg.delta, "base64");
-      enqueueToTwilio(ulawChunk);
+      enqueueToTwilio(Buffer.from(msg.delta, "base64"));
     }
-
-    // Some SDKs/versions also send response.output_audio.delta; handle that too.
     if (msg.type === "response.output_audio.delta" && typeof msg.delta === "string" && msg.delta.length) {
-      const ulawChunk = Buffer.from(msg.delta, "base64");
-      enqueueToTwilio(ulawChunk);
+      enqueueToTwilio(Buffer.from(msg.delta, "base64"));
+    }
+    if (msg.type === "response.delta" && msg.delta && typeof msg.delta.audio === "string") {
+      enqueueToTwilio(Buffer.from(msg.delta.audio, "base64"));
     }
 
-    // Optional: show transcript pieces while debugging
     if (DEBUG && msg.type === "response.audio_transcript.delta" && msg.delta) {
       console.log("[OA transcript]", msg.delta);
     }
@@ -267,9 +287,12 @@ wss.on("connection", (twilio, req) => {
   });
 
   oa.on("error", (e) => console.error("[/ws->OA] error:", e?.message || e));
-  oa.on("close", () => { console.log("[/ws->OA] closed"); if (!closed) try { twilio.close(); } catch {} });
+  oa.on("close", () => {
+    console.log("[/ws->OA] closed");
+    if (!closed) try { twilio.close(); } catch {}
+  });
 
-  // Twilio -> OA
+  // Twilio → OpenAI
   twilio.on("message", (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     const ev = m.event;
@@ -278,7 +301,7 @@ wss.on("connection", (twilio, req) => {
 
     if (ev === "start") {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
-      console.log("[/ws] event=start streamSid=", streamSid);
+      console.log("[/ws] event=start streamSid=", streamSid, "lang=", LANG);
       enqueueToTwilio(makeBeepUlaw(180, 880));
       return;
     }
@@ -296,6 +319,7 @@ wss.on("connection", (twilio, req) => {
       closed = true;
       if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
       if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
+      clearInterval(keepAlive);
       try { oa.close(); } catch {}
       try { twilio.close(); } catch {}
       return;
@@ -307,6 +331,7 @@ wss.on("connection", (twilio, req) => {
     closed = true;
     if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
     if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
+    clearInterval(keepAlive);
     try { oa.close(); } catch {}
   });
 });
