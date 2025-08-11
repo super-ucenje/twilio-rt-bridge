@@ -193,10 +193,10 @@ wss.on("connection", (twilio, req) => {
       if (!awaitingResponse) {
         awaitingResponse = true;
         // Force audio output each time
-        oa.send(JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio"], conversation: "default" }
-        }));
+oa.send(JSON.stringify({
+  type: "response.create",
+  response: { modalities: ["audio", "text"] }   // not ["audio"] only
+}));
       }
     }, delay);
   }
@@ -205,34 +205,29 @@ wss.on("connection", (twilio, req) => {
     console.log("[/ws->OA] Realtime open");
 
     // Session config. Include both legacy and current keys for max compatibility.
-    oa.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions: SESSION_INSTRUCTIONS,
-        modalities: ["text", "audio"],
-        voice: VOICE,
+oa.send(JSON.stringify({
+  type: "session.update",
+  session: {
+    instructions: SESSION_INSTRUCTIONS,
+    modalities: ["audio", "text"],           // include both
+    voice: VOICE,
 
-        // Input audio (Twilio -> OA)
-        input_audio_format: "g711_ulaw",
-        input_audio_sample_rate_hz: 8000,
-        input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: LANG },
+    // Twilio -> OpenAI audio
+    input_audio_format: "g711_ulaw",
+    input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: LANG },
 
-        // Output audio (OA -> Twilio)
-        audio_format: "g711_ulaw",              // some previews still read this
-        output_audio_format: "g711_ulaw",       // current name
-        output_audio_sample_rate_hz: 8000,
+    // OpenAI -> Twilio audio
+    audio_format: "g711_ulaw",
 
-        // Let server VAD help, we still do tiny commits for snappiness
-        turn_detection: { type: "server_vad", silence_duration_ms: 400 }
-      }
-    }));
+    turn_detection: { type: "server_vad", silence_duration_ms: 400 }
+  }
+}));
 
     // Proactive greeting (audio)
-    oa.send(JSON.stringify({
-      type: "response.create",
-      response: { modalities: ["audio"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
-    }));
-  });
+oa.send(JSON.stringify({
+  type: "response.create",
+  response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
+}));
 
   // Log EVERYTHING useful from OpenAI
   oa.on("message", (data) => {
