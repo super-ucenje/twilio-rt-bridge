@@ -1,6 +1,5 @@
 // server.js — Twilio <Stream> ↔ OpenAI Realtime (μ-law 8k), outbound dial
-// Fixes: use WS subprotocol "realtime", add compatible session fields,
-// force audio responses, and add verbose debug logging.
+// Clean handlers order, keepalive pings, strict audio modalities, concise logs.
 
 import express from "express";
 import http from "http";
@@ -17,11 +16,13 @@ const SESSION_INSTRUCTIONS =
   process.env.SESSION_INSTRUCTIONS ||
   "Ti si Ivana, ljubazna agentica korisničke podrške. Odgovaraj kratko i na hrvatskom. Ako ne znaš odgovor, reci da će te kolega uskoro nazvati.";
 
+// Twilio outbound
 const TWILIO_ACCOUNT_SID       = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN        = process.env.TWILIO_AUTH_TOKEN  || "";
 const TWILIO_FROM              = process.env.TWILIO_FROM        || "";
 const TWILIO_MACHINE_DETECTION = (process.env.TWILIO_MACHINE_DETECTION || "").trim();
 
+// TwiML / public URL
 const TWIML_URL = (process.env.TWIML_URL || "").trim();
 const BASE_URL  = (process.env.BASE_URL  || "").trim();
 
@@ -56,7 +57,7 @@ app.use(express.urlencoded({ extended: false })); // Twilio posts form data
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// Serve TwiML on GET and POST
+// Serve TwiML on GET and POST (Twilio will GET)
 app.all("/twiml", (req, res) => {
   const wsUrl = hostBase(req).replace(/^http/, "ws") + "/ws";
   const xml = `
@@ -65,7 +66,7 @@ app.all("/twiml", (req, res) => {
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`.trim();
-  console.log(`[twiml:${req.method}] wsUrl=`, wsUrl);
+  console.log(`[twiml:${req.method}] wsUrl=${wsUrl}`);
   res.set("Content-Type", "text/xml; charset=utf-8").status(200).send(xml);
 });
 
@@ -170,7 +171,7 @@ wss.on("connection", (twilio, req) => {
     }
   }
 
-  // Connect to OpenAI Realtime (IMPORTANT: subprotocol "realtime")
+  // --- OpenAI Realtime (subprotocol "realtime") ---
   if (!OPENAI_API_KEY) console.error("[/ws] OPENAI_API_KEY missing");
   const oa = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
@@ -183,6 +184,13 @@ wss.on("connection", (twilio, req) => {
     }
   );
 
+  // Keep-alive (some hosts drop idle WS)
+  const keepAlive = setInterval(() => {
+    try { oa.ping(); } catch {}
+    try { twilio.ping?.(); } catch {}
+  }, 15000);
+
+  // State for append/commit/respond
   let commitTimer = null;
   let awaitingResponse = false;
   function scheduleCommitAndRespond(delay = 250) {
@@ -192,44 +200,15 @@ wss.on("connection", (twilio, req) => {
       oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       if (!awaitingResponse) {
         awaitingResponse = true;
-        // Force audio output each time
-oa.send(JSON.stringify({
-  type: "response.create",
-  response: { modalities: ["audio", "text"] }   // not ["audio"] only
-}));
+        oa.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] } // request audio out
+        }));
       }
     }, delay);
   }
 
-  oa.on("open", () => {
-    console.log("[/ws->OA] Realtime open");
-
-    // Session config. Include both legacy and current keys for max compatibility.
-oa.send(JSON.stringify({
-  type: "session.update",
-  session: {
-    instructions: SESSION_INSTRUCTIONS,
-    modalities: ["audio", "text"],           // include both
-    voice: VOICE,
-
-    // Twilio -> OpenAI audio
-    input_audio_format: "g711_ulaw",
-    input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: LANG },
-
-    // OpenAI -> Twilio audio
-    audio_format: "g711_ulaw",
-
-    turn_detection: { type: "server_vad", silence_duration_ms: 400 }
-  }
-}));
-
-    // Proactive greeting (audio)
-oa.send(JSON.stringify({
-  type: "response.create",
-  response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
-}));
-
-  // Log EVERYTHING useful from OpenAI
+  // Register OA handlers first (so early events aren’t missed)
   oa.on("message", (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); }
@@ -240,7 +219,7 @@ oa.send(JSON.stringify({
 
     if (DEBUG && msg?.type) console.log("[OA]", msg.type);
 
-    // Audio deltas
+    // Audio chunks from OA -> Twilio
     if (
       (msg.type === "response.output_audio.delta" ||
        msg.type === "response.audio.delta" ||
@@ -250,12 +229,10 @@ oa.send(JSON.stringify({
       enqueueToTwilio(ulawChunk);
     }
 
-    // Useful to see text content while debugging
     if (DEBUG && msg.type === "response.output_text.delta" && msg.delta) {
       console.log("[OA text]", msg.delta);
     }
 
-    // If the API sends any error, surface it
     if ((msg.type && msg.type.includes("error")) || msg.error) {
       console.warn("[OA ERROR]", JSON.stringify(msg, null, 2));
     }
@@ -263,22 +240,62 @@ oa.send(JSON.stringify({
     if (msg.type === "response.completed" || msg.type === "response.error") {
       awaitingResponse = false;
     }
+
+    if (msg.type === "session.created") {
+      console.log("[OA] session.created");
+    }
   });
 
   oa.on("error", (e) => console.error("[/ws->OA] error:", e?.message || e));
-  oa.on("close", () => { console.log("[/ws->OA] closed"); if (!closed) try { twilio.close(); } catch {} });
+  oa.on("close", () => {
+    console.log("[/ws->OA] closed");
+    if (!closed) try { twilio.close(); } catch {}
+  });
 
-  // Twilio -> OA
+  oa.on("open", () => {
+    console.log("[/ws->OA] Realtime open");
+
+    // Session config (audio in/out = G.711 μ-law @ 8 kHz)
+    oa.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        instructions: SESSION_INSTRUCTIONS,
+        modalities: ["audio", "text"],
+        voice: VOICE,
+
+        // Twilio -> OpenAI audio
+        input_audio_format: "g711_ulaw",
+        input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: LANG },
+
+        // OpenAI -> Twilio audio
+        audio_format: "g711_ulaw",
+
+        // Server-side VAD (we still proactively commit on small pauses)
+        turn_detection: { type: "server_vad", silence_duration_ms: 400 }
+      }
+    }));
+
+    // Proactive greeting (audio)
+    oa.send(JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
+    }));
+  });
+
+  // --- Twilio <Stream> side ---
   twilio.on("message", (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     const ev = m.event;
 
-    if (ev === "connected") { console.log("[/ws] event=connected"); return; }
+    if (ev === "connected") {
+      console.log("[/ws] event=connected");
+      return;
+    }
 
     if (ev === "start") {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
       console.log("[/ws] event=start streamSid=", streamSid);
-      enqueueToTwilio(makeBeepUlaw(180, 880));
+      enqueueToTwilio(makeBeepUlaw(180, 880)); // sanity beep
       return;
     }
 
@@ -286,7 +303,7 @@ oa.send(JSON.stringify({
       const b64 = m.media?.payload;
       if (!b64 || oa.readyState !== WebSocket.OPEN) return;
       oa.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      scheduleCommitAndRespond(250);
+      scheduleCommitAndRespond(250); // quick turn-around
       return;
     }
 
@@ -295,6 +312,7 @@ oa.send(JSON.stringify({
       closed = true;
       if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
       if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
+      clearInterval(keepAlive);
       try { oa.close(); } catch {}
       try { twilio.close(); } catch {}
       return;
@@ -306,6 +324,7 @@ oa.send(JSON.stringify({
     closed = true;
     if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
     if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
+    clearInterval(keepAlive);
     try { oa.close(); } catch {}
   });
 });
