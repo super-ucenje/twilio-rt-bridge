@@ -15,16 +15,17 @@ const SESSION_INSTRUCTIONS =
 // Twilio creds for outbound
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_FROM        = process.env.TWILIO_FROM        || ""; // verified or purchased caller ID (E.164)
+const TWILIO_FROM        = process.env.TWILIO_FROM        || ""; // verified/purchased E.164
 const TWILIO_MACHINE_DETECTION = process.env.TWILIO_MACHINE_DETECTION || ""; // e.g. "Enable" or ""
 
-// Where Twilio fetches TwiML from. If not set, we’ll use `${BASE_URL}/twiml`
-const TWIML_URL = process.env.TWIML_URL || "";
-// Your public Railway base URL, e.g. "https://twilio-rt-bridge-production.up.railway.app"
-const BASE_URL  = process.env.BASE_URL  || "";
+// If set, Twilio will fetch this URL for TwiML. If empty, we inline TwiML in the API call.
+const TWIML_URL = (process.env.TWIML_URL || "").trim();
 
-// ----- μ-law helpers -----
-function makeBeepUlaw(ms = 250, freq = 880, amp = 9000) {
+// Public Railway base URL, e.g. "https://twilio-rt-bridge-production.up.railway.app"
+const BASE_URL  = (process.env.BASE_URL || "").trim();
+
+// ----- helpers -----
+function makeBeepUlaw(ms = 180, freq = 880, amp = 9000) {
   const BIAS = 0x84, CLIP = 32635;
   const samples = Math.floor(8000 * (ms / 1000));
   const out = new Uint8Array(samples);
@@ -42,25 +43,38 @@ function makeBeepUlaw(ms = 250, freq = 880, amp = 9000) {
   return out;
 }
 
+function hostBase(req) {
+  // Prefer explicit BASE_URL if set, else derive from request host
+  const base = BASE_URL || `https://${req.get("host")}`;
+  return base;
+}
+
 // ----- app + routes -----
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // for Twilio status callbacks
 
 // Health
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// TwiML served by this app (use if you don’t want a TwiML Bin)
+// TwiML served by this app (optional)
 app.get("/twiml", (req, res) => {
-  const base = BASE_URL || `https://${req.get("host")}`;
-  const wsUrl = base.replace(/^http/, "ws") + "/ws";
+  const wsUrl = hostBase(req).replace(/^http/, "ws") + "/ws";
   const xml = `
 <Response>
   <Connect>
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`.trim();
+  console.log("[/twiml] serving TwiML with wsUrl:", wsUrl);
   res.set("Content-Type", "text/xml; charset=utf-8").status(200).send(xml);
+});
+
+// Twilio status callback (so we can see failures)
+app.post("/twilio-status", (req, res) => {
+  console.log("[/twilio-status]", JSON.stringify(req.body || {}, null, 2));
+  res.status(200).send("ok");
 });
 
 // Outbound call trigger (POST /trigger-call {to:"+3859..."})
@@ -77,22 +91,35 @@ app.post("/trigger-call", async (req, res) => {
     if (!TWILIO_FROM)
       return res.status(400).json({ ok: false, error: "Missing TWILIO_FROM env (verified/purchased E.164)" });
 
-    const host = req.get("host");
-    const base = BASE_URL || `https://${host}`;
+    const base = hostBase(req);
     const wsUrl = base.replace(/^http/, "ws") + "/ws";
 
-    const twiml = `
+    // Either inline TwiML or fetch from /twiml
+    let used;
+    const form = new URLSearchParams();
+    form.set("To", to);
+    form.set("From", TWILIO_FROM);
+    if (TWILIO_MACHINE_DETECTION) form.set("MachineDetection", TWILIO_MACHINE_DETECTION);
+
+    // Status callback to see exact Twilio error reasons
+    form.set("StatusCallback", base + "/twilio-status");
+    form.set("StatusCallbackEvent", "initiated ringing answered completed");
+
+    if (TWIML_URL) {
+      used = "Url";
+      form.set("Url", TWIML_URL);
+    } else {
+      used = "Twiml";
+      const twiml = `
 <Response>
   <Connect>
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`.trim();
+      form.set("Twiml", twiml);
+    }
 
-    const form = new URLSearchParams();
-    form.set("To", to);
-    form.set("From", TWILIO_FROM);
-    if (TWIML_URL) form.set("Url", TWIML_URL); else form.set("Twiml", twiml);
-    if (TWILIO_MACHINE_DETECTION) form.set("MachineDetection", TWILIO_MACHINE_DETECTION);
+    console.log("[/trigger-call] creating call", { to, used, wsUrl });
 
     const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`, {
       method: "POST",
@@ -107,9 +134,12 @@ app.post("/trigger-call", async (req, res) => {
     let payload;
     try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
 
-    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload, wsUrl, used: TWIML_URL ? "Url" : "Twiml" });
-    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to, wsUrl, used: TWIML_URL ? "Url" : "Twiml" });
+    console.log("[/trigger-call] Twilio resp", resp.status, payload);
+    if (!resp.ok) return res.status(resp.status).json({ ok: false, error: payload, wsUrl, used });
+
+    return res.status(200).json({ ok: true, call_sid: payload.sid, status: payload.status, to, wsUrl, used });
   } catch (e) {
+    console.error("[/trigger-call] error", e);
     return res.status(500).json({ ok: false, error: String(e) });
   }
 });
@@ -118,9 +148,10 @@ app.post("/trigger-call", async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-wss.on("connection", (twilio) => {
+wss.on("connection", (twilio, req) => {
   let streamSid = "";
   let closed = false;
+  console.log("[/ws] Twilio connected from", req.socket.remoteAddress);
 
   // outbound pacing queue (160 bytes == 20 ms μ-law @ 8 kHz)
   let outQueue = Buffer.alloc(0);
@@ -136,118 +167,13 @@ wss.on("connection", (twilio) => {
         const payload = Buffer.from(frame).toString("base64");
         try {
           twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-        } catch (_) {}
+        } catch (e) {
+          console.warn("[/ws] twilio.send failed", e?.message || e);
+        }
       }, 20);
     }
   }
 
   // --- OpenAI Realtime WS ---
-  const oa = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    }
-  );
-
-  // state for committing audio and triggering responses
-  let commitTimer = null;
-  let awaitingResponse = false;
-
-  function scheduleCommitAndRespond(delay = 300) {
-    if (commitTimer) clearTimeout(commitTimer);
-    commitTimer = setTimeout(() => {
-      if (oa.readyState !== WebSocket.OPEN) return;
-      oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      if (!awaitingResponse) {
-        awaitingResponse = true;
-        oa.send(JSON.stringify({ type: "response.create", response: { conversation: "default" } }));
-      }
-    }, delay);
-  }
-
-  oa.on("open", () => {
-    oa.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions: SESSION_INSTRUCTIONS,
-        modalities: ["text", "audio"],
-        voice: VOICE,
-        input_audio_format: "g711_ulaw",
-        input_audio_sample_rate_hz: 8000,
-        input_audio_transcription: { model: "whisper-1", language: LANG },
-        output_audio_format: "g711_ulaw",
-        output_audio_sample_rate_hz: 8000,
-        turn_detection: { type: "server_vad", silence_duration_ms: 400 }
-      }
-    }));
-
-    // proactive greeting
-    oa.send(JSON.stringify({
-      type: "response.create",
-      response: { instructions: "Pozdrav! Kako Vam mogu pomoći?" }
-    }));
-  });
-
-  oa.on("message", (data) => {
-    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
-
-    // stream μ-law audio from OpenAI → Twilio
-    if (
-      (msg.type === "response.output_audio.delta" ||
-       msg.type === "response.audio.delta" ||
-       msg.type === "response.delta") && msg.delta?.audio
-    ) {
-      const ulawChunk = Buffer.from(msg.delta.audio, "base64");
-      enqueueToTwilio(ulawChunk);
-    }
-
-    if (msg.type === "response.completed" || msg.type === "response.error") {
-      awaitingResponse = false;
-    }
-  });
-
-  oa.on("error", (e) => console.error("OpenAI WS error:", e?.message || e));
-  oa.on("close", () => { if (!closed) try { twilio.close(); } catch {} });
-
-  // --- Twilio <Stream> side ---
-  twilio.on("message", (raw) => {
-    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    const ev = m.event;
-
-    if (ev === "start") {
-      streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
-      enqueueToTwilio(makeBeepUlaw(180, 880));
-      return;
-    }
-
-    if (ev === "media") {
-      const b64 = m.media?.payload;
-      if (!b64 || oa.readyState !== WebSocket.OPEN) return;
-      oa.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      scheduleCommitAndRespond(300);
-      return;
-    }
-
-    if (ev === "stop") {
-      closed = true;
-      if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
-      if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
-      try { oa.close(); } catch {}
-      try { twilio.close(); } catch {}
-      return;
-    }
-  });
-
-  twilio.on("close", () => {
-    closed = true;
-    if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
-    if (pacingTimer) { clearInterval(pacingTimer); pacingTimer = null; }
-    try { oa.close(); } catch {}
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => console.log(`up on :${PORT}`));
+  if (!OPENAI_API_KEY) {
+    console.error("[/ws] OPENAI_API
