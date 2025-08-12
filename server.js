@@ -30,6 +30,9 @@ const TWILIO_MACHINE_DETECTION = (process.env.TWILIO_MACHINE_DETECTION || "").tr
 const TWIML_URL = (process.env.TWIML_URL || "").trim();
 const BASE_URL  = (process.env.BASE_URL  || "").trim();
 
+// Serve static files from "public" directory
+app.use(express.static("public"));
+
 // ---------- utils ----------
 const OA_LANGS = new Set([
   "af","ar","az","be","bg","bs","ca","cs","cy","da","de","el","en","es","et",
