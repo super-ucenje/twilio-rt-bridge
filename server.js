@@ -1,9 +1,9 @@
-// server.js — Twilio <Stream> ↔ OpenAI Realtime (G.711 μ-law 8k) + outbound dial
-// Fixes:
-//  • Normalize LANG (handles C.UTF-8 etc.)
-//  • Valid session fields; request audio+text responses
-//  • Read OpenAI audio from msg.delta (string) and pace as 160B/20ms
-//  • Send Twilio media with track:"outbound"
+// server.js — Twilio <Stream> ↔ OpenAI Realtime (G.711 μ-law 8k) + outbound dial + graceful hangup
+// Novi dio:
+//  • normLang() popravlja LANG (C.UTF-8 → hr)
+//  • tools: ["hangup_call"] — model može zatražiti prekid poziva
+//  • detekcija pozdrava u ulaznoj transkripciji i/ili asistentovom tekstu
+//  • uredan Twilio hangup nakon što se isporuči zadnji audio frame
 
 import express from "express";
 import http from "http";
@@ -18,15 +18,15 @@ const DEBUG          = (process.env.DEBUG || "0") === "1";
 
 const SESSION_INSTRUCTIONS =
   process.env.SESSION_INSTRUCTIONS ||
-  "Ti si Ivana, ljubazna agentica korisničke podrške. Odgovaraj kratko i na hrvatskom. Ako ne znaš odgovor, reci da će te kolega uskoro nazvati.";
+  "Ti si Ivana, ljubazna agentica korisničke podrške. Odgovaraj kratko i na hrvatskom. " +
+  "Ako korisnik kaže da je gotovo (npr. 'doviđenja', 'bok', 'to je sve'), kratko se pristojno oprosti " +
+  "i POZOVI alat hangup_call kako bi se poziv prekinuo.";
 
-// Twilio outbound
 const TWILIO_ACCOUNT_SID       = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN        = process.env.TWILIO_AUTH_TOKEN  || "";
 const TWILIO_FROM              = process.env.TWILIO_FROM        || "";
 const TWILIO_MACHINE_DETECTION = (process.env.TWILIO_MACHINE_DETECTION || "").trim();
 
-// Public URL / TwiML
 const TWIML_URL = (process.env.TWIML_URL || "").trim();
 const BASE_URL  = (process.env.BASE_URL  || "").trim();
 
@@ -37,18 +37,19 @@ const OA_LANGS = new Set([
   "ko","lt","lv","mi","mk","mr","ms","ne","nl","no","pl","pt","ro","ru","sk",
   "sl","sr","sv","sw","ta","th","tl","tr","uk","ur","vi","zh"
 ]);
-
 function normLang(v, fallback = "hr") {
   if (!v) return fallback;
   let s = String(v).trim().toLowerCase();
-  // handle "C", "C.UTF-8"
-  if (s === "c" || s.startsWith("c.")) return fallback;
-  // take first token before _ . -
-  s = s.split(/[_.-]/)[0];
+  if (s === "c" || s.startsWith("c.")) return fallback;     // C / C.UTF-8
+  s = s.split(/[_.-]/)[0];                                  // hr-HR / en_US.UTF-8 → hr / en
   if (s.length !== 2) return fallback;
   return OA_LANGS.has(s) ? s : fallback;
 }
 const LANG = normLang(RAW_LANG);
+
+function hostBase(req) {
+  return BASE_URL || `https://${req.get("host")}`;
+}
 
 // 8k μ-law beep
 function makeBeepUlaw(ms = 180, freq = 880, amp = 9000) {
@@ -69,10 +70,6 @@ function makeBeepUlaw(ms = 180, freq = 880, amp = 9000) {
   return out;
 }
 
-function hostBase(req) {
-  return BASE_URL || `https://${req.get("host")}`;
-}
-
 // ---------- app ----------
 const app = express();
 app.use(express.json());
@@ -81,7 +78,7 @@ app.use(express.urlencoded({ extended: false })); // Twilio posts form data
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// TwiML (GET or POST)
+// TwiML (GET/POST)
 app.all("/twiml", (req, res) => {
   const wsUrl = hostBase(req).replace(/^http/, "ws") + "/ws";
   const xml = `
@@ -169,12 +166,16 @@ app.post("/trigger-call", async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
+// regexi za “pozdrav” (HR varijante)
+const FAREWELL_RE = /\b(dovi[đd]enja?|bok|to je sve|hvala.*dovi|vidimo se|lijep? pozdrav)\b/i;
+
 wss.on("connection", (twilio, req) => {
   let streamSid = "";
-  let closed = false;
+  let callSid   = "";
+  let closed    = false;
   console.log("[/ws] Twilio connected from", req.socket.remoteAddress);
 
-  // Pace μ-law back to Twilio: 160 bytes every ~20ms
+  // μ-law pacing back to Twilio (160 B ~= 20 ms)
   let outQueue = Buffer.alloc(0);
   let pacingTimer = null;
   function enqueueToTwilio(ulawBytes) {
@@ -190,7 +191,7 @@ wss.on("connection", (twilio, req) => {
           twilio.send(JSON.stringify({
             event: "media",
             streamSid,
-            media: { payload, track: "outbound" } // explicit outbound
+            media: { payload, track: "outbound" } // eksplicitno outbound
           }));
           if (DEBUG) console.log("[twilio<-oa] 160B");
         } catch (e) {
@@ -219,9 +220,12 @@ wss.on("connection", (twilio, req) => {
     try { twilio.ping?.(); } catch {}
   }, 15000);
 
-  // Turn handling
+  // Turn handling / hangup state
   let commitTimer = null;
   let awaitingResponse = false;
+  let wantHangup = false;                 // set when we detect goodbye or tool call
+  let lastAssistantText = "";             // accumulate assistant text per response
+
   function scheduleCommitAndRespond(delay = 250) {
     if (commitTimer) clearTimeout(commitTimer);
     commitTimer = setTimeout(() => {
@@ -229,6 +233,7 @@ wss.on("connection", (twilio, req) => {
       oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       if (!awaitingResponse) {
         awaitingResponse = true;
+        lastAssistantText = "";
         oa.send(JSON.stringify({
           type: "response.create",
           response: { modalities: ["audio", "text"] }
@@ -237,8 +242,56 @@ wss.on("connection", (twilio, req) => {
     }, delay);
   }
 
+  async function twilioHangupNow(reason = "goodbye") {
+    if (!callSid || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
+    try {
+      const form = new URLSearchParams();
+      form.set("Status", "completed");
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: form.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) console.warn("[hangup] Twilio error", r.status, t);
+      else console.log("[hangup] Twilio OK", callSid, reason);
+    } catch (e) {
+      console.warn("[hangup] exception", e?.message || e);
+    }
+  }
+
+  function drainAndHangup(reason = "goodbye") {
+    // pričekaj da se isporuči sav audio pa prekini poziv
+    const check = setInterval(async () => {
+      if (outQueue.length === 0) {
+        clearInterval(check);
+        setTimeout(async () => {
+          await twilioHangupNow(reason);
+          try { oa.close(); } catch {}
+          try { twilio.close(); } catch {}
+        }, 120); // malo vremena nakon zadnjeg frame-a
+      }
+    }, 30);
+  }
+
+  // ---- OpenAI event handling ----
   oa.on("open", () => {
     console.log("[/ws->OA] Realtime open");
+    // Tools: allow assistant to ask for hangup
+    const tools = [{
+      type: "function",
+      name: "hangup_call",
+      description: "Hang up the current phone call immediately when the caller says goodbye or the task is done.",
+      parameters: {
+        type: "object",
+        properties: { reason: { type: "string", description: "why the call should be ended" } }
+      }
+    }];
+
     oa.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -248,10 +301,12 @@ wss.on("connection", (twilio, req) => {
         input_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "whisper-1", language: LANG },
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", silence_duration_ms: 400 }
+        turn_detection: { type: "server_vad", silence_duration_ms: 400 },
+        tools
       }
     }));
-    // Proactive greeting
+
+    // Proaktivni pozdrav
     oa.send(JSON.stringify({
       type: "response.create",
       response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
@@ -262,7 +317,7 @@ wss.on("connection", (twilio, req) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
     if (DEBUG && msg?.type) console.log("[OA]", msg.type);
 
-    // Audio deltas (base64 μ-law bytes in msg.delta)
+    // Assistant audio → Twilio
     if (msg.type === "response.audio.delta" && typeof msg.delta === "string" && msg.delta.length) {
       enqueueToTwilio(Buffer.from(msg.delta, "base64"));
     }
@@ -273,16 +328,51 @@ wss.on("connection", (twilio, req) => {
       enqueueToTwilio(Buffer.from(msg.delta.audio, "base64"));
     }
 
-    if (DEBUG && msg.type === "response.audio_transcript.delta" && msg.delta) {
-      console.log("[OA transcript]", msg.delta);
+    // Assistant text (za fallback detekciju)
+    if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
+      lastAssistantText += msg.delta;
+    }
+
+    // Tool-call za hangup (razni oblici eventova — pokrivamo široko)
+    if (
+      (msg.type === "response.tool_call.created" && msg.tool?.name === "hangup_call") ||
+      (msg.type === "response.tool_call.delta"   && msg.tool_name  === "hangup_call") ||
+      (msg.type === "response.tool_call.completed" && (msg.name === "hangup_call" || msg.tool_name === "hangup_call"))
+    ) {
+      wantHangup = true;
+      if (DEBUG) console.log("[OA] hangup_call requested by tool");
+    }
+
+    // Ulazna transkripcija korisnika (razni nazivi u Realtimeu)
+    // Ako dobijemo tekst i vidi se “doviđenja/bok…”, zabilježi želju za prekidom.
+    if (
+      (msg.type && msg.type.includes("input_audio_transcription")) &&
+      (typeof msg.transcript === "string" || typeof msg.text === "string")
+    ) {
+      const utt = (msg.transcript || msg.text || "");
+      if (DEBUG && utt) console.log("[USER said]", utt);
+      if (FAREWELL_RE.test(utt)) {
+        wantHangup = true;
+        if (DEBUG) console.log("[detected farewell in user speech]");
+      }
+    }
+
+    // Nakon što je odgovor gotov, ako želimo prekinuti — pričekaj drain pa hangup
+    if (msg.type === "response.completed" || msg.type === "response.error") {
+      // Fallback: ako nema tool-calla, ali se asistent sam pozdravio, također prekini
+      if (!wantHangup && lastAssistantText && FAREWELL_RE.test(lastAssistantText)) {
+        wantHangup = true;
+        if (DEBUG) console.log("[detected farewell in assistant text]");
+      }
+      if (wantHangup) {
+        drainAndHangup("farewell");
+      }
+      lastAssistantText = "";
+      awaitingResponse = false;
     }
 
     if ((msg.type && msg.type.includes("error")) || msg.error) {
       console.warn("[OA ERROR]", JSON.stringify(msg, null, 2));
-    }
-
-    if (msg.type === "response.completed" || msg.type === "response.error") {
-      awaitingResponse = false;
     }
   });
 
@@ -292,7 +382,7 @@ wss.on("connection", (twilio, req) => {
     if (!closed) try { twilio.close(); } catch {}
   });
 
-  // Twilio → OpenAI
+  // ---- Twilio side ----
   twilio.on("message", (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     const ev = m.event;
@@ -301,7 +391,9 @@ wss.on("connection", (twilio, req) => {
 
     if (ev === "start") {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
-      console.log("[/ws] event=start streamSid=", streamSid, "lang=", LANG);
+      callSid   = m.start?.callSid   || m.callSid   || callSid   || "";
+      console.log("[/ws] event=start streamSid=", streamSid, "callSid=", callSid, "lang=", LANG);
+      // kratak beep da znaš da je outbound kanal živ
       enqueueToTwilio(makeBeepUlaw(180, 880));
       return;
     }
