@@ -4,6 +4,7 @@
 //  • tools: ["hangup_call"] — model može zatražiti prekid poziva
 //  • detekcija pozdrava u ulaznoj transkripciji i/ili asistentovom tekstu
 //  • uredan Twilio hangup nakon što se isporuči zadnji audio frame
+//  • NEW: robustno parsiranje function_call_arguments.delta/.done i izvršenje hangup alata
 
 import express from "express";
 import http from "http";
@@ -167,7 +168,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 // regexi za “pozdrav” (HR varijante)
-const FAREWELL_RE = /\b(dovi[đd]enja?|bok|to je sve|hvala.*dovi|vidimo se|lijep? pozdrav)\b/i;
+const FAREWELL_RE = /\b(dovi[đd]enja?|bok|to je sve|hvala(?:\s+vam|\s+ti)?(?:\s+lijepo)?|vidimo se|lijep? pozdrav)\b/i;
 
 wss.on("connection", (twilio, req) => {
   let streamSid = "";
@@ -191,7 +192,7 @@ wss.on("connection", (twilio, req) => {
           twilio.send(JSON.stringify({
             event: "media",
             streamSid,
-            media: { payload, track: "outbound" } // eksplicitno outbound
+            media: { payload, track: "outbound" }
           }));
           if (DEBUG) console.log("[twilio<-oa] 160B");
         } catch (e) {
@@ -225,6 +226,9 @@ wss.on("connection", (twilio, req) => {
   let awaitingResponse = false;
   let wantHangup = false;                 // set when we detect goodbye or tool call
   let lastAssistantText = "";             // accumulate assistant text per response
+
+  // NEW/CHANGED: buffer for streamed tool-call args
+  const pendingToolCalls = new Map(); // id -> { name, argsChunk }
 
   function scheduleCommitAndRespond(delay = 250) {
     if (commitTimer) clearTimeout(commitTimer);
@@ -333,10 +337,38 @@ wss.on("connection", (twilio, req) => {
       lastAssistantText += msg.delta;
     }
 
-    // Tool-call za hangup (razni oblici eventova — pokrivamo široko)
+    // --- NEW/CHANGED: robust tool-call handling (function_call_arguments.*) ---
+    // Buffer streamed args
+    if (msg.type === "response.function_call_arguments.delta") {
+      const id = msg.item_id || msg.tool_call_id || msg.call_id || "default";
+      const entry = pendingToolCalls.get(id) || { name: msg.name || msg.tool_name || "", argsChunk: "" };
+      if (msg.name || msg.tool_name) entry.name = msg.name || msg.tool_name;
+      entry.argsChunk += (msg.delta || "");
+      pendingToolCalls.set(id, entry);
+      if (DEBUG) console.log("[OA] fc_args.delta", entry.name || "(unknown)");
+    }
+
+    // When args are done, parse and execute
+    if (msg.type === "response.function_call_arguments.done") {
+      const id = msg.item_id || msg.tool_call_id || msg.call_id || "default";
+      const entry = pendingToolCalls.get(id);
+      if (entry) {
+        pendingToolCalls.delete(id);
+        let args = {};
+        try { args = entry.argsChunk ? JSON.parse(entry.argsChunk) : {}; } catch {}
+        const toolName = entry.name || msg.name || msg.tool_name || "";
+        if (DEBUG) console.log("[OA] fc_args.done", toolName, args);
+
+        if (toolName === "hangup_call") {
+          wantHangup = true; // signal to drain & hang up after response completes
+        }
+      }
+    }
+
+    // Legacy/non-delta tool-call signals (kept as backup)
     if (
-      (msg.type === "response.tool_call.created" && msg.tool?.name === "hangup_call") ||
-      (msg.type === "response.tool_call.delta"   && msg.tool_name  === "hangup_call") ||
+      (msg.type === "response.tool_call.created"   && msg.tool?.name === "hangup_call") ||
+      (msg.type === "response.tool_call.delta"     && msg.tool_name     === "hangup_call") ||
       (msg.type === "response.tool_call.completed" && (msg.name === "hangup_call" || msg.tool_name === "hangup_call"))
     ) {
       wantHangup = true;
@@ -344,7 +376,6 @@ wss.on("connection", (twilio, req) => {
     }
 
     // Ulazna transkripcija korisnika (razni nazivi u Realtimeu)
-    // Ako dobijemo tekst i vidi se “doviđenja/bok…”, zabilježi želju za prekidom.
     if (
       (msg.type && msg.type.includes("input_audio_transcription")) &&
       (typeof msg.transcript === "string" || typeof msg.text === "string")
