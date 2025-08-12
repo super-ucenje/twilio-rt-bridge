@@ -1,9 +1,4 @@
 // server.js — Twilio <Stream> ↔ OpenAI Realtime (G.711 μ-law 8k) + outbound dial + graceful hangup
-// Key additions in this patch:
-//  • ACK tool calls with response.tool_output (PATCH A)
-//  • requestHangup(): say goodbye (optional), drain audio, Twilio REST hangup (PATCH B)
-//  • Trigger hangup immediately on tool-call OR farewell in user speech (PATCH C)
-//  • Add timeout fallback in case OA doesn’t produce audio (PATCH D)
 
 import express from "express";
 import http from "http";
@@ -30,9 +25,6 @@ const TWILIO_MACHINE_DETECTION = (process.env.TWILIO_MACHINE_DETECTION || "").tr
 const TWIML_URL = (process.env.TWIML_URL || "").trim();
 const BASE_URL  = (process.env.BASE_URL  || "").trim();
 
-// Serve static files from "public" directory
-app.use(express.static("public"));
-
 // ---------- utils ----------
 const OA_LANGS = new Set([
   "af","ar","az","be","bg","bs","ca","cs","cy","da","de","el","en","es","et",
@@ -54,29 +46,13 @@ function hostBase(req) {
   return BASE_URL || `https://${req.get("host")}`;
 }
 
-// 8k μ-law beep
-function makeBeepUlaw(ms = 180, freq = 880, amp = 9000) {
-  const BIAS = 0x84, CLIP = 32635;
-  const samples = Math.floor(8000 * (ms / 1000));
-  const out = new Uint8Array(samples);
-  for (let n = 0; n < samples; n++) {
-    let s = Math.round(amp * Math.sin(2 * Math.PI * freq * (n / 8000)));
-    let sign = (s >> 8) & 0x80;
-    if (sign !== 0) s = -s;
-    if (s > CLIP) s = CLIP;
-    s += BIAS;
-    let exponent = 7;
-    for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
-    const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
-    out[n] = ~(sign | (exponent << 4) | mantissa) & 0xff;
-  }
-  return out;
-}
-
 // ---------- app ----------
-const app = express();
+const app = express();                      // ✅ create app first
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// ✅ now it's safe to mount static
+app.use(express.static("public"));          // serves /public/* as https://.../file
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
@@ -227,10 +203,9 @@ wss.on("connection", (twilio, req) => {
   let commitTimer = null;
   let awaitingResponse = false;
 
-  // PATCH B: unified hangup request
   let hangupRequested = false;
   let hangupReason = "farewell";
-  let hangupTimeout = null; // PATCH D
+  let hangupTimeout = null;
 
   function scheduleCommitAndRespond(delay = 250) {
     if (commitTimer) clearTimeout(commitTimer);
@@ -270,7 +245,6 @@ wss.on("connection", (twilio, req) => {
   }
 
   function drainAndHangup(reason = "goodbye") {
-    // wait audio drain, then hang up
     const check = setInterval(async () => {
       if (outQueue.length === 0) {
         clearInterval(check);
@@ -283,14 +257,12 @@ wss.on("connection", (twilio, req) => {
     }, 30);
   }
 
-  // PATCH B: requestHangup — can speak a short goodbye before hanging up
   function requestHangup(reason = "farewell", sayGoodbye = true) {
     if (hangupRequested) return;
     hangupRequested = true;
     hangupReason = reason;
 
     if (sayGoodbye && oa.readyState === WebSocket.OPEN) {
-      // short, final line; model won’t continue after we hang up anyway
       oa.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -300,11 +272,10 @@ wss.on("connection", (twilio, req) => {
       }));
     }
 
-    // Fallback timeout in case OA never produces audio (PATCH D)
     if (hangupTimeout) clearTimeout(hangupTimeout);
     hangupTimeout = setTimeout(() => {
       drainAndHangup(reason);
-    }, 2500); // give ~2.5s for TTS bytes to arrive before forcing hangup
+    }, 2500);
   }
 
   // --- OA session setup ---
@@ -334,14 +305,14 @@ wss.on("connection", (twilio, req) => {
       }
     }));
 
-    // optional greeting
+    // first line
     oa.send(JSON.stringify({
       type: "response.create",
       response: { modalities: ["audio", "text"], instructions: "Pozdrav! Kako Vam mogu pomoći?" }
     }));
   });
 
-  // PATCH A: buffer streamed tool-call args; ACK with response.tool_output
+  // Tool-call args buffering + ACK
   const pendingToolCalls = new Map(); // id -> { name, argsChunk }
   function ackToolOutput(tool_call_id, payload) {
     if (oa.readyState !== WebSocket.OPEN) return;
@@ -389,10 +360,7 @@ wss.on("connection", (twilio, req) => {
         if (DEBUG) console.log("[OA] tool DONE:", toolName, args, "id=", id);
 
         if (toolName === "hangup_call") {
-          // ACK the tool so the model can finish its turn cleanly (IMPORTANT)
           ackToolOutput(id, { ok: true, reason: args?.reason || "requested" });
-
-          // Trigger hangup flow immediately (don’t wait for response.completed)
           requestHangup(args?.reason || "tool");
         }
       }
@@ -408,7 +376,7 @@ wss.on("connection", (twilio, req) => {
       requestHangup("tool-legacy");
     }
 
-    // user speech transcripts → immediate hangup if farewell (PATCH C)
+    // user speech transcripts → immediate hangup if farewell
     if (
       (msg.type && msg.type.includes("input_audio_transcription")) &&
       (typeof msg.transcript === "string" || typeof msg.text === "string")
@@ -450,9 +418,7 @@ wss.on("connection", (twilio, req) => {
       streamSid = m.start?.streamSid || m.streamSid || streamSid || "STREAM";
       callSid   = m.start?.callSid   || m.callSid   || callSid   || "";
       console.log("[/ws] event=start streamSid=", streamSid, "callSid=", callSid, "lang=", LANG);
-      // beep to confirm outbound channel
-      enqueueToTwilio(makeBeepUlaw(180, 880));
-      return;
+      return; // ✅ removed beep
     }
 
     if (ev === "media") {
